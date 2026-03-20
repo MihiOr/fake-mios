@@ -16,7 +16,7 @@ The repository is prepared for public sharing:
 
 Demo playback of a custom `MIGIF` file with alpha-channel animations:
 
-- [FakeMIOS lizards playback](assets/fake-mios-lizards-playback.mp4)
+![FakeMIOS MIGIF playback demo](assets/fake-mios-lizards-playback.gif)
 
 ## Current features
 
