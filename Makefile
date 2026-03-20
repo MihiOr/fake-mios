@@ -125,7 +125,7 @@ usb:
 	sudo mkdir -p /mnt/usb
 	sudo mount -t drvfs E: /mnt/usb
 	rm -r -f /mnt/usb/*
-	cp -r image/* /mnt/usb
+	find image -mindepth 1 -maxdepth 1 ! -name NvVars -exec cp -r {} /mnt/usb \;
 	sync
 	while mountpoint -q /mnt/usb; do sudo umount /mnt/usb; done
 

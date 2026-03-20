@@ -10,6 +10,14 @@ The repository is prepared for public sharing:
 - private signing material under `keys/` is intentionally ignored
 - generated build outputs, staged assets, and machine-local runtime state are intentionally ignored
 
+## Preview
+
+![FakeMIOS terminal preview](assets/fake-mios-terminal.png)
+
+Demo playback of a custom `MIGIF` file with alpha-channel animations:
+
+- [FakeMIOS lizards playback](assets/fake-mios-lizards-playback.mp4)
+
 ## Current features
 
 - shell-style command interface inside a UEFI application
