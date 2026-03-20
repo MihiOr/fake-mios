@@ -1,0 +1,941 @@
+MIGIF DECODER FULL SUPPORT SPECIFICATION
+======================================
+
+Purpose
+-------
+This document explains what a decoder must implement in order to fully read, validate,
+decode, render, and play back a .migif file produced by the current MIGIF ecosystem in
+this repository.
+
+This text is based on the actual implementation and observed format contract in:
+- files/migif/migif_decoder.py
+- files/migif/migif_encoder.py
+- files/migif/migif_editor.py
+
+The goal is not just "open file and show something". The goal is full practical support:
+- parse valid MIGIF files produced by current tools
+- reject malformed files with useful errors
+- correctly support all frame types and all payload encodings
+- preserve playback semantics exactly enough that output matches current decoder behavior
+- handle both major version 1 and major version 2 files that share the same core layout
+
+
+1. High-level decoder responsibilities
+--------------------------------------
+To fully support MIGIF, a decoder must contain at least these subsystems:
+
+1. Binary reader:
+   Must read little-endian binary structures, enforce bounds, and fail on truncated data.
+
+2. File parser:
+   Must parse:
+   - file header
+   - optional block area
+   - frame stream
+
+3. Validation layer:
+   Must validate header fields, offsets, sizes, denominators, rect bounds, palette indices,
+   and payload lengths.
+
+4. Palette subsystem:
+   Must support global palette decoding for indexed FULL and DELTA frames.
+
+5. Pixel decoding subsystem:
+   Must support:
+   - RAW RGBA8888
+   - RLE RGBA8888
+   - RAW INDEX8
+   - RLE INDEX8
+   for both FULL and DELTA payloads.
+
+6. Stateful frame application engine:
+   Must maintain:
+   - current base canvas pixels
+   - current transform state
+
+7. Presentation renderer:
+   Must render the current base canvas with current transform state into a target surface.
+
+8. Playback/timing engine:
+   Must play using per-frame durations, not only header FPS.
+
+9. Loop handling:
+   Must obey loop flag if used as a player.
+
+10. Compatibility behavior:
+   Must handle files written by:
+   - migif_encoder.py
+   - migif_editor.py
+   and accept version_major 1 and 2 as current code does.
+
+
+2. Endianness and primitive formats
+-----------------------------------
+All multi-byte values are little-endian.
+
+Observed format strings:
+- FILE_HEADER_FMT            = "<5sBBBBIIIIIIIIII"
+- BLOCK_HEADER_FMT           = "<4sI"
+- FRAME_HEADER_FMT           = "<IHHIIIII"
+- FULL_PAYLOAD_HEADER_FMT    = "<HHIII"
+- DELTA_PAYLOAD_HEADER_FMT   = "<HH"
+- DELTA_RECT_HEADER_FMT      = "<IIIII"
+- TRANSFORM_PAYLOAD_FMT      = "<IiiIiii"
+
+Observed byte sizes:
+- FILE_HEADER_SIZE           = 49
+- BLOCK_HEADER_SIZE          = 8
+- FRAME_HEADER_SIZE          = 28
+- FULL_PAYLOAD_HEADER_SIZE   = 16
+- DELTA_PAYLOAD_HEADER_SIZE  = 4
+- DELTA_RECT_HEADER_SIZE     = 20
+- TRANSFORM_PAYLOAD_SIZE     = 28
+
+Important consequence:
+The file header is 49 bytes, not a round number. A decoder must not assume alignment or
+padding beyond what the format explicitly defines.
+
+
+3. File magic, versions, and core constants
+-------------------------------------------
+File magic:
+- b"MIGIF"
+
+Current writer version:
+- major = 2
+- minor = 0
+
+Current decoder compatibility:
+- accepts major version 1
+- accepts major version 2
+- rejects other major versions
+
+Core file flags:
+- MIGIF_FLAG_LOOP     = 0x01
+- MIGIF_FLAG_HAS_PLTE = 0x02
+
+Current color format identifiers:
+- MIGIF_COLOR_RGBA8888 = 0
+
+Frame type identifiers:
+- MIGIF_FRAME_FULL      = 1
+- MIGIF_FRAME_DELTA     = 2
+- MIGIF_FRAME_TRANSFORM = 3
+
+FULL payload encodings:
+- MIGIF_ENCODING_RAW_RGBA8888 = 0
+- MIGIF_ENCODING_RLE_RGBA8888 = 1
+- MIGIF_ENCODING_RAW_INDEX8   = 2
+- MIGIF_ENCODING_RLE_INDEX8   = 3
+
+DELTA rect encodings:
+- MIGIF_DELTA_RAW_RGBA8888 = 0
+- MIGIF_DELTA_RLE_RGBA8888 = 1
+- MIGIF_DELTA_RAW_INDEX8   = 2
+- MIGIF_DELTA_RLE_INDEX8   = 3
+
+Transform flag bits:
+- MIGIF_TF_POS_X     = 1 << 0
+- MIGIF_TF_POS_Y     = 1 << 1
+- MIGIF_TF_ALPHA     = 1 << 2
+- MIGIF_TF_SCALE_X   = 1 << 3
+- MIGIF_TF_SCALE_Y   = 1 << 4
+- MIGIF_TF_ROTATION  = 1 << 5
+
+
+4. Top-level file layout
+------------------------
+Logical order in file:
+
+1. File header
+2. Block area
+3. Frame stream
+
+Current writers produce:
+- file header first
+- optional PLTE block(s) in block area
+- then frame blobs
+
+The current writer computes:
+- blocks_size = size of serialized blocks
+- frames_offset = FILE_HEADER_SIZE + blocks_size
+- file_size = frames_offset + total frame bytes
+
+A decoder should use the explicit offsets and sizes from the header, not assumptions.
+However, for strict compatibility with current writer output, it is reasonable to expect:
+- frames_offset == header_size + blocks_size
+
+
+5. File header layout and meaning
+---------------------------------
+Header fields in order:
+
+1. magic         : 5 bytes   : must be b"MIGIF"
+2. version_major : 1 byte
+3. version_minor : 1 byte
+4. header_size   : 1 byte
+5. flags         : 1 byte
+6. canvas_width  : uint32
+7. canvas_height : uint32
+8. frame_count   : uint32
+9. fps_num       : uint32
+10. fps_den      : uint32
+11. blocks_size  : uint32
+12. frames_offset: uint32
+13. file_size    : uint32
+14. reserved0    : uint32
+15. reserved1    : uint32
+
+Important semantic notes:
+
+- header_size:
+  Current writer sets this to FILE_HEADER_SIZE (49).
+  A decoder must not assume that forever.
+  Correct behavior is:
+  - require header_size >= FILE_HEADER_SIZE
+  - skip any extra bytes between FILE_HEADER_SIZE and header_size
+  - begin block parsing at header_size
+
+- canvas_width / canvas_height:
+  Define the base canvas dimensions, not window size.
+  FULL and DELTA modify this canvas.
+  Transform frames affect presentation of this canvas, not the canvas dimensions themselves.
+
+- frame_count:
+  Number of frame records to parse from frames_offset onward.
+  Current decoder rejects 0.
+
+- fps_num / fps_den:
+  Informational/global timeline FPS in header.
+  Current player shows it in window title, but actual playback timing uses per-frame
+  duration_num / duration_den from each frame.
+  A correct decoder/player must therefore not treat header FPS as authoritative timing.
+
+- blocks_size:
+  Size of block area starting at file offset header_size.
+
+- frames_offset:
+  Offset where frame stream starts.
+
+- file_size:
+  Must match actual file length.
+
+- reserved0 / reserved1:
+  Currently written as 0.
+  Current parser ignores their value.
+  A strict writer should set them to 0.
+  A robust decoder may ignore them or expose them for diagnostics.
+
+Minimum validation required for header:
+- magic must match
+- major version must be supported
+- header_size >= FILE_HEADER_SIZE
+- fps_den != 0
+- canvas_width > 0
+- canvas_height > 0
+- frame_count > 0
+- file_size == actual byte length
+- frames_offset <= file_size
+- block area must not run beyond file_size
+
+
+6. Block area
+-------------
+Blocks start at file offset header_size.
+Blocks occupy blocks_size bytes.
+Each block has:
+- magic     : 4 bytes
+- block_size: uint32
+
+Important:
+- block_size includes the 8-byte block header itself
+- decoder must be able to skip unknown blocks by seeking to block_start + block_size
+- current parser walks until r.tell() == header_size + blocks_size
+
+Current known block:
+- PLTE
+
+Current parser behavior:
+- unknown block magic values are ignored and skipped
+- this is important for forward compatibility
+
+Recommended decoder behavior:
+- skip unknown blocks by size
+- optionally expose them to callers if needed
+
+
+7. PLTE block
+-------------
+Purpose:
+- global palette for indexed FULL or DELTA frames
+
+Current writer emits at most one PLTE block when palette optimization is possible.
+
+PLTE payload structure after generic block header:
+- color_count : uint32
+- color_format: uint8
+- reserved0   : uint8
+- reserved1   : uint16
+- colors      : color_count * RGBA8888 entries
+
+Each palette entry:
+- r : uint8
+- g : uint8
+- b : uint8
+- a : uint8
+
+Current supported color_format:
+- 0 = RGBA8888
+
+Decoder requirements:
+- must read color_count palette entries
+- must require color_format == MIGIF_COLOR_RGBA8888
+- must store palette as ordered array/list
+- palette index values in indexed payloads refer into this global palette
+
+Current ecosystem assumptions:
+- if indexed FULL or indexed DELTA exists, PLTE must exist
+- writer also sets MIGIF_FLAG_HAS_PLTE when palette block is written
+
+Important robustness note:
+- current parser does not fully cross-check block_size against color_count * 4
+- a production decoder should consider validating exact PLTE payload size
+- at minimum, it must detect truncation
+
+
+8. Frame stream
+---------------
+Frames begin at frames_offset.
+Exactly frame_count frames are parsed.
+
+Each frame record consists of:
+- frame header
+- payload
+
+Frame header fields:
+1. frame_size    : uint32
+2. frame_type    : uint16
+3. frame_flags   : uint16
+4. duration_num  : uint32
+5. duration_den  : uint32
+6. payload_size  : uint32
+7. reserved0     : uint32
+8. reserved1     : uint32
+
+Observed semantics:
+- frame_size includes the 28-byte frame header
+- payload_size excludes the frame header
+- current writers set frame_flags = 0
+- current writers set reserved0 = 0, reserved1 = 0
+- current decoder parses frame_flags and reserved fields but does not use them
+
+Required validation:
+- frame_size >= FRAME_HEADER_SIZE
+- duration_den != 0
+- frame_size == FRAME_HEADER_SIZE + payload_size
+- frame must stay within file bounds
+- parser should advance exactly to frame_start + frame_size
+
+Authoritative playback timing:
+- duration_num / duration_den per frame
+
+Important:
+Header FPS is not enough to play correctly.
+A full decoder/player must use each frame's own duration.
+
+
+9. Decoder runtime state model
+------------------------------
+A full MIGIF decoder is stateful.
+It must maintain at least:
+
+1. Base pixel canvas:
+   Dimensions = canvas_width x canvas_height
+   Format = RGBA
+
+2. Transform state:
+   Current values:
+   - pos_x
+   - pos_y
+   - alpha
+   - scale_x
+   - scale_y
+   - rotation_deg
+
+Observed default transform identity:
+- pos_x = 0
+- pos_y = 0
+- alpha = 255
+- scale_x = 65536
+- scale_y = 65536
+- rotation_deg = 0
+
+This means transform values are stored in fixed-point 16.16 form for:
+- pos_x
+- pos_y
+- scale_x
+- scale_y
+- rotation_deg
+
+Observed presentation conversion:
+- pos_x_real = round(pos_x / 65536.0)
+- pos_y_real = round(pos_y / 65536.0)
+- scale_x_real = scale_x / 65536.0
+- scale_y_real = scale_y / 65536.0
+- rotation_deg_real = rotation_deg / 65536.0
+
+Alpha is not fixed-point.
+Alpha is direct 0..255.
+
+
+10. FULL frame semantics
+------------------------
+FULL payload layout:
+- encoding : uint16
+- reserved : uint16
+- width    : uint32
+- height   : uint32
+- data_size: uint32
+- data     : data_size bytes
+
+Semantic meaning:
+- FULL provides a complete new image for the top-left portion of the canvas
+- FULL clears the entire existing canvas to transparent before copying the FULL image
+- FULL then resets transform state to identity
+
+This reset behavior is critical.
+The current decoder does:
+- decode FULL pixel image
+- clear entire canvas to transparent
+- copy FULL image into top-left of canvas
+- set transform = identity
+
+Therefore:
+- FULL is both pixel replacement and transform reset
+- any previous transform does not carry across a FULL frame
+
+Bounds rule:
+- FULL width and height must not exceed canvas dimensions
+
+Placement rule:
+- FULL is always placed at canvas origin (0, 0)
+- there is no x/y inside FULL payload
+
+Meaning of smaller-than-canvas FULL:
+- only the top-left width x height region is filled from payload
+- remainder of canvas becomes transparent because canvas is cleared first
+
+Supported FULL encodings:
+- RAW_RGBA8888
+- RLE_RGBA8888
+- RAW_INDEX8
+- RLE_INDEX8
+
+
+11. FULL encoding details
+-------------------------
+11.1 RAW_RGBA8888
+- payload data must be exactly width * height * 4 bytes
+- pixel order is RGBA, 8 bits per channel
+- pixels are stored row-major, left-to-right, top-to-bottom
+
+11.2 RLE_RGBA8888
+Encoded stream is repeated runs:
+- run_length : uint16
+- r          : uint8
+- g          : uint8
+- b          : uint8
+- a          : uint8
+
+Decoder requirements:
+- run_length must not be 0
+- decoded pixel count must equal width * height exactly
+- row boundaries are not encoded explicitly; decode flat stream row-major
+
+11.3 RAW_INDEX8
+- payload data must be exactly width * height bytes
+- each byte is a palette index into global PLTE
+- decoder must error if palette is absent
+- decoder must error if any index >= palette length
+
+11.4 RLE_INDEX8
+Encoded stream is repeated runs:
+- run_length : uint16
+- index      : uint8
+
+Decoder requirements:
+- run_length must not be 0
+- decoded index count must equal width * height exactly
+- decoder must error if palette is absent
+- decoder must error if any decoded index >= palette length
+
+
+12. DELTA frame semantics
+-------------------------
+DELTA payload layout:
+- encoding   : uint16
+- rect_count : uint16
+- then rect_count rectangle records
+
+Each rectangle record:
+- x        : uint32
+- y        : uint32
+- w        : uint32
+- h        : uint32
+- data_size: uint32
+- data     : data_size bytes
+
+Semantic meaning:
+- DELTA does not replace the whole canvas
+- DELTA mutates only listed rectangles on the existing canvas
+- DELTA does not clear the rest of the canvas
+- DELTA does not reset transform state
+
+That last point is critical:
+If transform was previously set by a TRANSFORM frame, then DELTA updates the underlying
+base canvas while the transform remains active for presentation.
+
+Bounds rule for each rect:
+- w > 0
+- h > 0
+- x + w <= canvas_width
+- y + h <= canvas_height
+
+Supported DELTA encodings:
+- RAW_RGBA8888
+- RLE_RGBA8888
+- RAW_INDEX8
+- RLE_INDEX8
+
+Rect encoding is shared by all rects inside a single DELTA payload.
+In the current format, one DELTA payload has one encoding field that applies to every
+rect it contains.
+
+Current writers usually emit only one rect per DELTA frame, but the format supports many.
+
+
+13. DELTA encoding details
+--------------------------
+DELTA rect data decodes exactly like FULL image data, except the decoded image dimensions
+are the rect dimensions w and h.
+
+13.1 DELTA RAW_RGBA8888
+- data size must be w * h * 4
+
+13.2 DELTA RLE_RGBA8888
+- same run format as FULL RLE RGBA
+- decoded pixel count must be w * h
+
+13.3 DELTA RAW_INDEX8
+- data size must be w * h
+- requires PLTE
+
+13.4 DELTA RLE_INDEX8
+- same run format as FULL RLE INDEX8
+- decoded index count must be w * h
+- requires PLTE
+
+Rect application order:
+- current decoder applies rectangles in the order they appear in payload
+- if rectangles overlap, later rectangles overwrite earlier ones
+
+Important no-op case:
+- DELTA with rect_count = 0 is valid in current ecosystem
+- current editor exporter uses this for "same frame pixels, only duration advances"
+- decoder must treat this as a legal no-op on the base canvas
+
+
+14. TRANSFORM frame semantics
+-----------------------------
+TRANSFORM payload size is always exactly 28 bytes.
+
+Payload fields:
+1. transform_flags : uint32
+2. pos_x           : int32
+3. pos_y           : int32
+4. alpha           : uint32
+5. scale_x         : int32
+6. scale_y         : int32
+7. rotation_deg    : int32
+
+Transform frame does not change base canvas pixels.
+It only mutates presentation state.
+
+Each field is applied only if its flag bit is set.
+Unset fields leave previous transform state unchanged.
+
+Meaning of each field when enabled:
+- POS_X:
+  sets x translation in 16.16 fixed-point pixels
+
+- POS_Y:
+  sets y translation in 16.16 fixed-point pixels
+
+- ALPHA:
+  sets uniform whole-surface alpha 0..255
+
+- SCALE_X:
+  sets horizontal scale in 16.16 fixed-point
+  identity = 65536
+
+- SCALE_Y:
+  sets vertical scale in 16.16 fixed-point
+  identity = 65536
+
+- ROTATION:
+  sets rotation in 16.16 fixed-point degrees
+
+Current presentation behavior:
+- positive stored rotation is rendered clockwise, because renderer calls rotate(-deg)
+
+Current alpha rule:
+- alpha must be <= 255 if flag is set
+
+Current scale rule:
+- if scale_x <= 0 or scale_y <= 0, decoder returns a transparent 1x1 surface
+  and effectively nothing visible is drawn
+- current implementation does not use negative scale for mirroring
+
+Critical persistence rule:
+- TRANSFORM state persists across following frames until changed
+- FULL resets transform to identity
+- DELTA does not reset transform
+- TRANSFORM with no flags is valid and means "keep current transform"
+
+That last case matters because current encoder emits no-op TRANSFORM frames when two
+consecutive source frames have identical pixels and only duration must advance.
+
+
+15. Rendering model a complete decoder must follow
+--------------------------------------------------
+There are two layers of state:
+
+Layer A: base canvas pixels
+- modified by FULL and DELTA
+- not modified by TRANSFORM
+
+Layer B: presentation transform
+- modified by TRANSFORM
+- reset by FULL
+
+To render a displayable frame at any moment:
+
+1. Convert current canvas pixels to an RGBA surface/image.
+2. Apply current transform state to that entire surface:
+   - set overall alpha
+   - scale
+   - rotate
+   - place at translated position
+3. Composite result into output target/background.
+
+Observed current player behavior:
+- target is cleared to a chosen background color each displayed frame
+- transformed canvas surface is blitted onto target
+
+Important implication:
+The file format itself stores transparency.
+The display background is a player decision, not part of file content.
+Therefore a decoder intended for reuse should expose transparent RGBA output or allow
+caller-specified background compositing.
+
+
+16. Timing and playback semantics
+---------------------------------
+Authoritative timing is per-frame:
+- duration_sec = duration_num / duration_den
+
+Current player:
+- renders one frame
+- then waits until that duration expires
+
+Looping:
+- if MIGIF_FLAG_LOOP is set, playback restarts from frame 0 after last frame
+- otherwise playback stops after final frame
+
+Header FPS:
+- current player computes it from header.fps_num / header.fps_den
+- current player also computes average timeline FPS from all frame durations
+- these are displayed as info only
+- actual playback pacing still uses per-frame durations
+
+Therefore a full decoder/player must:
+- preserve per-frame timing
+- not normalize everything to header FPS
+
+
+17. Required parser and validator behavior
+------------------------------------------
+A decoder that "fully supports" MIGIF should implement at least these checks:
+
+File/header checks:
+- exact file magic
+- supported major version
+- header_size sane
+- file_size matches real bytes
+- fps_den non-zero
+- canvas dimensions non-zero
+- frame_count non-zero
+- block area within file
+- frames_offset within file
+
+Block checks:
+- each block_size >= BLOCK_HEADER_SIZE
+- each block stays within block area
+- PLTE color_format supported
+- PLTE not truncated
+
+Frame checks:
+- enough bytes for each frame header
+- frame_size sane
+- payload_size consistent
+- frame fits within file
+- duration_den non-zero
+
+FULL checks:
+- payload long enough for subheader
+- payload exact length after reading data_size
+- width * height decode size matches encoded size
+- width/height do not exceed canvas
+- indexed encodings require palette
+- palette indices in range
+
+DELTA checks:
+- payload long enough for DELTA subheader
+- each rect header within payload
+- each rect data within payload
+- w and h non-zero
+- rect in canvas bounds
+- decoded size exact
+- indexed encodings require palette
+- palette indices in range
+- parser ends exactly at payload end
+
+TRANSFORM checks:
+- exact payload size
+- alpha <= 255 if alpha flag used
+
+Recommended additional strictness:
+- verify writer-reserved fields are 0 if you want stricter validation
+- expose relaxed mode if you need forward compatibility
+
+
+18. Unknown and future fields
+-----------------------------
+Current format contains several places reserved for future use:
+- header extension bytes when header_size > FILE_HEADER_SIZE
+- header reserved0 / reserved1
+- frame_flags
+- frame reserved0 / reserved1
+- unknown blocks
+
+A well-designed decoder should:
+- ignore or preserve unknown blocks by skipping them via block_size
+- skip header extension region via header_size
+- store raw frame_flags if API wants future-proofing
+
+Current practical compatibility target:
+- decode files produced by current writers
+- do not break if a future writer adds an unknown block before frames
+
+
+19. Compatibility with current writers in this repo
+---------------------------------------------------
+There are two relevant write paths.
+
+19.1 migif_encoder.py
+This path may produce:
+- global palette + indexed FULL/DELTA frames if <= 256 colors
+- RGBA FULL/DELTA frames otherwise
+- TRANSFORM frames for:
+  - uniform alpha change over entire image
+  - no-op hold frames when pixels are identical
+
+So a decoder that only supports FULL RGBA is incomplete.
+To fully support repo-generated MIGIF, it must support:
+- FULL
+- DELTA
+- TRANSFORM
+- indexed encodings
+- RGBA encodings
+
+19.2 migif_editor.py export_project
+Current editor export path mainly emits:
+- FULL RGBA
+- DELTA RGBA
+- no palette
+- no transform frames
+- major version 2
+
+This means many modern edited files will appear simpler than full format capability.
+Do not mistake that reduced subset for the whole format.
+
+
+20. Practical state machine for a decoder
+-----------------------------------------
+A correct playback/state application loop is conceptually:
+
+Initialize:
+- parse MIGIF
+- create transparent RGBA canvas of canvas_width x canvas_height
+- transform = identity
+
+For each frame:
+- if frame_type == FULL:
+  - decode FULL image
+  - clear canvas to transparent
+  - copy decoded FULL image into top-left of canvas
+  - transform = identity
+
+- else if frame_type == DELTA:
+  - decode DELTA rects
+  - patch canvas rectangles in order
+  - keep transform unchanged
+
+- else if frame_type == TRANSFORM:
+  - decode transform payload
+  - update only flagged transform fields
+  - keep canvas unchanged
+
+- else:
+  - reject as unsupported frame type
+
+- present current state:
+  - convert canvas to surface/image
+  - apply transform
+  - composite to output
+
+- wait for duration_num / duration_den
+
+
+21. Performance considerations
+------------------------------
+These are not format rules, but they matter if you want a decoder that is both correct
+and usable.
+
+Current optimized decoder path in repo uses byte buffers for canvas and bulk conversion
+to pygame surface. That is much faster than per-pixel Python set_at calls.
+
+Recommended internal representation:
+- keep canvas as contiguous RGBA bytearray
+- decode RLE directly into bytes when possible
+- convert indexed data directly to RGBA bytes in one pass
+- apply DELTA rects by row slicing, not per-pixel object creation
+
+Why this matters:
+- MIGIF files exported by editor can be large
+- performance bottleneck usually comes from rendering path, not parsing
+
+But note:
+Optimization must not change semantics.
+State rules described above still apply.
+
+
+22. Edge cases a complete decoder must explicitly handle
+--------------------------------------------------------
+- FULL frame smaller than canvas
+- DELTA with rect_count = 0
+- TRANSFORM with flags = 0
+- Indexed payload with missing palette -> error
+- Palette index out of range -> error
+- RLE run_length = 0 -> error
+- RLE over-decode or under-decode -> error
+- DELTA rect partially outside canvas -> error
+- FULL width/height larger than canvas -> error
+- duration_den = 0 -> error
+- file_size mismatch -> error
+- blocks_size overflow -> error
+- unsupported major version -> error
+
+
+23. Behavior that is easy to get wrong
+--------------------------------------
+1. Using header FPS for timing instead of per-frame durations.
+   This is wrong for actual playback compatibility.
+
+2. Treating TRANSFORM as pixel modification.
+   It is presentation-only state.
+
+3. Resetting transform after DELTA.
+   Wrong. DELTA keeps transform.
+
+4. Forgetting FULL resets transform.
+   Wrong output if omitted.
+
+5. Forgetting FULL clears the whole canvas.
+   Wrong if you only overwrite width x height without clearing remainder.
+
+6. Assuming DELTA always has one rect.
+   Current writers often do, but format supports many.
+
+7. Assuming only RGBA frames exist.
+   Indexed frames are real format support and decoder must implement them.
+
+8. Treating no-op TRANSFORM as invalid.
+   Current encoder uses it legitimately.
+
+9. Treating rect_count = 0 DELTA as invalid.
+   Current editor exporter uses it legitimately.
+
+10. Assuming positive rotation means counter-clockwise.
+    Current implementation effectively renders positive stored values clockwise.
+
+
+24. Recommended public API surface for a reusable decoder
+---------------------------------------------------------
+If building a decoder library, the API should ideally expose:
+
+- parse only:
+  load_migif(path) -> parsed structure
+
+- decode/apply one frame:
+  apply_frame(state, frame) -> new state
+
+- render current state:
+  render_state(state, background=None) -> RGBA image/surface
+
+- iterate timeline:
+  for frame in migif.frames: ...
+
+- metadata:
+  - canvas size
+  - frame count
+  - header FPS
+  - per-frame durations
+  - loop flag
+  - palette presence
+
+Keeping parse/decode/render separate makes the implementation easier to test and easier
+to port to another runtime.
+
+
+25. Minimal checklist for "full support"
+----------------------------------------
+A decoder can be considered full-support for current MIGIF if and only if it does all of
+the following:
+
+- Reads little-endian header, blocks, and frames correctly
+- Accepts major version 1 and 2
+- Supports PLTE global palette block
+- Supports FULL frames
+- Supports DELTA frames
+- Supports TRANSFORM frames
+- Supports RAW and RLE RGBA encodings
+- Supports RAW and RLE INDEX8 encodings
+- Maintains persistent canvas state
+- Maintains persistent transform state
+- Resets transform on FULL
+- Keeps transform across DELTA
+- Applies TRANSFORM as presentation-only state
+- Uses per-frame durations for playback
+- Honors loop flag
+- Preserves transparency correctly
+- Rejects malformed files with size/bounds/palette/RLE validation
+
+
+26. Final implementation note
+-----------------------------
+If your target is "can open all MIGIF files this repo can produce", you must not design
+decoder support around only the editor export path. The editor currently emits a simpler
+subset, but the real format supported by the repository includes palette-based frames and
+stateful transform playback. Full support means implementing the format contract, not the
+smallest currently convenient subset.
