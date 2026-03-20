@@ -67,6 +67,20 @@ This target:
 
 If the required files are missing, the target fails with a clear error instead of producing a half-configured boot image.
 
+### Release archive
+
+To create a GitHub Releases-ready archive of the staged boot image:
+
+```bash
+make release
+```
+
+This produces:
+
+- `dist/fake-mios-image.zip`
+
+The archive contains the staged `image/` directory and excludes the local `image/NvVars` runtime state file.
+
 ## Local key setup
 
 The `keys/` directory is intentionally ignored by Git. Create it locally and generate your own key pair and certificate.
@@ -129,6 +143,34 @@ make usb
 ```
 
 It checks that drive `E:` exists and has the label `MIOS` before touching it, and it also depends on the local Secure Boot signing material.
+
+## Installing on a USB drive
+
+For a manual USB installation:
+
+1. Format the USB drive as `FAT32`.
+2. Build and stage the boot image:
+
+```bash
+make release
+```
+
+3. Open the generated `image/` directory.
+4. Copy everything inside `image/` to the root of the USB drive.
+
+Important:
+
+- copy the contents of `image/`, not the `image` folder itself
+- after copying, the USB root should contain `EFI/` and `boot_keys/`
+- the release archive `dist/fake-mios-image.zip` follows the same layout
+
+If Secure Boot is enabled on the target machine, the user also needs to trust the local signing certificate:
+
+- use `boot_keys/mios.der` from the prepared image
+- import or enroll that certificate through the firmware Secure Boot interface or through MokManager, depending on the platform
+- after the certificate is trusted, shim can continue to `grubx64.efi`
+
+Without certificate enrollment, Secure Boot systems may refuse to launch the signed FakeMIOS loader.
 
 ## Boot layout
 

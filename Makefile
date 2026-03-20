@@ -10,6 +10,8 @@ EFI_LDS = /usr/lib/elf_$(ARCH)_efi.lds
 EFI_LIBDIR = /usr/lib
 OVMF_CODE_SECBOOT = /usr/share/OVMF/OVMF_CODE_4M.secboot.fd
 OVMF_VARS = OVMF_VARS_4M.ms.fd
+RELEASE_DIR = dist
+RELEASE_ZIP = $(RELEASE_DIR)/fake-mios-image.zip
 
 SIGN_KEY = keys/mios.key
 SIGN_CERT = keys/mios.crt
@@ -24,7 +26,7 @@ OBJ = main.o
 SO = main.so
 EFI = grubx64.efi
 
-.PHONY: all copy run clean build usb check-secureboot-files
+.PHONY: all copy run clean build usb release check-secureboot-files
 
 all: $(EFI)
 
@@ -55,7 +57,17 @@ check-secureboot-files:
 		fi; \
 	done
 
-copy: check-secureboot-files $(EFI)
+copy: check-secureboot-files $(SO)
+	objcopy \
+		-j .text \
+		-j .sdata \
+		-j .data \
+		-j .dynamic \
+		-j .dynsym \
+		-j .rel \
+		-j .rela \
+		-j .reloc \
+		--target=efi-app-$(ARCH) $(SO) $(EFI)
 	objcopy --set-section-alignment .sbat=512 --add-section .sbat=$(SBAT_FILE) --adjust-section-vma .sbat+0x10000000 $(EFI) $(EFI)
 	sbsign --key $(SIGN_KEY) --cert $(SIGN_CERT) --output $(EFI) $(EFI)
 	mkdir -p image/boot_keys
@@ -116,3 +128,11 @@ usb:
 	cp -r image/* /mnt/usb
 	sync
 	while mountpoint -q /mnt/usb; do sudo umount /mnt/usb; done
+
+release: 
+	make clean
+	make
+	make copy
+	mkdir -p $(RELEASE_DIR)
+	rm -f $(RELEASE_ZIP)
+	zip -r $(RELEASE_ZIP) image -x "image/NvVars"

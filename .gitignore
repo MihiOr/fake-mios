@@ -6,9 +6,9 @@
 /BOOTX64.EFI
 
 /OVMF_VARS_4M.ms.fd
+/dist/
 /image/NvVars
 
 /image/boot_keys/
 /image/EFI/BOOT/grubx64.efi
 /image/EFI/BOOT/assets/
-
